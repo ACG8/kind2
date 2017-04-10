@@ -44,12 +44,9 @@ let print_stats () =
 
   Event.stat
     ([Stat.misc_stats_title, Stat.misc_stats] @
-     (if Flags.IC3.abstr () = `IA then 
         [Stat.ic3_stats_title, Stat.ic3_stats;
-         Stat.ic3ia_stats_title, Stat.ic3ia_stats]
-      else 
-        [Stat.ic3_stats_title, Stat.ic3_stats]) @
-     [Stat.smt_stats_title, Stat.smt_stats])
+         Stat.ic3ia_stats_title, Stat.ic3ia_stats] @
+	[Stat.smt_stats_title, Stat.smt_stats])
 
 
 (* Cleanup before exit *)
@@ -949,56 +946,34 @@ let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates =
                 
                 (* Extrapolate from counterexample to a cube in R_k *)
                 let cti_gen = 
+		  
+                  (* Evaluate all predicates on CTI *)
+                  List.map 
 
-                  (* Abstraction used? *)
-                  match Flags.IC3.abstr () with
+                    (fun p ->
 
-                    (* No abstraction *)
-                    | `None ->
-
-                      (* Compute preimage with quantifier elimination
-
-                         P[x] & R_k[x] & T[x,x'] & ~P[x'] is sat
-
-                         R_k does not imply P[x] yet *)
-                      extrapolate 
-                        trans_sys 
-                        cti 
-                        (C.term_of_prop_set prop_set :: 
-                           List.map C.term_of_clause (F.values r_k)
-                            |> Term.mk_and)
-                        (C.term_of_prop_set prop_set |> Term.negate) 
-
-                    (* Implicit abstraction *)
-                    | `IA ->
-
-                      (* Evaluate all predicates on CTI *)
-                      List.map 
-
-                        (fun p ->
-
-                          match
+                      match
 
                             (* Evaluate predicate *)
-                            Eval.eval_term
-                              (TransSys.uf_defs trans_sys)
-                              cti
-                              p
-                              
-                          with
+                        Eval.eval_term
+                          (TransSys.uf_defs trans_sys)
+                          cti
+                          p
+                          
+                      with
 
                             (* Predicate evaluates to true, use positively *)
-                            | Eval.ValBool true -> p
+                      | Eval.ValBool true -> p
 
                             (* Predicate evaluates to true, use negatively *)
-                            | Eval.ValBool false -> Term.negate p
+                      | Eval.ValBool false -> Term.negate p
 
                             (* Predicate must evaluate to either true or
                                false, we cannot have a partial model *)
-                            | _ -> assert false)
-                        
-                        predicates
-                        
+                      | _ -> assert false)
+                    
+                    predicates
+                    
                 in
 
                 (* Create a clause with activation literals from
@@ -1469,49 +1444,44 @@ let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates =
                  let raise_cex () = 
                    raise (Counterexample (block_clause :: block_trace))
                  in
+		 
+                 SMTSolver.trace_comment 
+                   solver
+                   (Format.sprintf
+                      "block: generating interpolants."
+                   );
 
-                 (match Flags.IC3.abstr () with
-                   | `None ->
-                     raise_cex ()
+                 let cex_trace =
+                   List.map
+                     (fun bcl -> Term.mk_and (List.map Term.negate (Clause.literals_of_clause bcl)))
+                     (block_clause :: block_trace)
+                 in
 
-                   | `IA ->
-                     SMTSolver.trace_comment 
+                 let interpolants = abstr_simulate cex_trace trans_sys raise_cex in
+
+
+
+                 List.iteri
+                   (fun i t ->
+                     SMTSolver.assert_term
                        solver
-                       (Format.sprintf
-                          "block: generating interpolants."
-                       );
+                       (Term.mk_eq
+                          [t;
+                           Term.bump_state (Numeral.of_int 2) t]);
 
-                     let cex_trace =
-                       List.map
-                         (fun bcl -> Term.mk_and (List.map Term.negate (Clause.literals_of_clause bcl)))
-                         (block_clause :: block_trace)
-                     in
-
-                     let interpolants = abstr_simulate cex_trace trans_sys raise_cex in
-
-
-
-                     List.iteri
-                       (fun i t ->
-                         SMTSolver.assert_term
-                           solver
-                           (Term.mk_eq
-                              [t;
-                               Term.bump_state (Numeral.of_int 2) t]);
-
-                         SMTSolver.assert_term
-                           solver
-                           (Term.mk_eq
-                              [Term.bump_state (Numeral.one) t;
-                               Term.bump_state (Numeral.of_int 3) t]);
-                       )
-                       interpolants;
-
-
-                     block
+                     SMTSolver.assert_term
                        solver
-                       input_sys 
-                       aparam
+                       (Term.mk_eq
+                          [Term.bump_state (Numeral.one) t;
+                           Term.bump_state (Numeral.of_int 3) t]);
+                   )
+                   interpolants;
+
+
+                 block
+                   solver
+                   input_sys 
+                   aparam
                        trans_sys
                        prop_set
                        term_tbl
@@ -1519,7 +1489,7 @@ let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates =
                        []
                        (List.rev (List.map (fun (f,s) -> s) trace))
 
-                 )
+                 
 
                (* i > 1 and bad state is reachable from R_i-1 *)
                | r_pred_i :: frames_tl -> 
@@ -1527,65 +1497,53 @@ let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates =
                  (* Generalize the counterexample to a list of literals
 
                     R_i-1[x] & C[x] & T[x,x'] & ~C[x'] is sat *)
-                 let cti_gen =
-                   match Flags.IC3.abstr () with
-                     | `None ->
+                  let cti_gen =
+                    List.map 
+                      (fun p ->match  Eval.eval_term
+                          (TransSys.uf_defs trans_sys)
+                          cti
+                          p
+                        with
 
-                       extrapolate 
-                         trans_sys 
-                         cti
-                         ((C.term_of_clause block_clause ::
-                             List.map C.term_of_clause clauses_r_pred_i) 
-                             |> Term.mk_and)
-                         (C.term_of_clause block_clause |> Term.negate)
+                        | Eval.ValBool true -> p
 
-                     | `IA ->
-                       List.map 
-                         (fun p ->match  Eval.eval_term
-                             (TransSys.uf_defs trans_sys)
-                             cti
-                             p
-                           with
+                        | Eval.ValBool false -> Term.negate p
 
-                             | Eval.ValBool true -> p
+                        | _ -> raise (Invalid_argument "abstract cex evaluation")
 
-                             | Eval.ValBool false -> Term.negate p
+                      )
+                      predicates
+                  in
 
-                             | _ -> raise (Invalid_argument "abstract cex evaluation")
+                  (* Create a clause with activation literals from generalized
+                     counterexample *)
+                  let block_clause' = 
+                    C.mk_clause_of_literals
+                      (C.BlockRec block_clause)
+                      (List.map Term.negate cti_gen) 
+                  in
 
-                         )
-                         predicates
-                 in
-
-                 (* Create a clause with activation literals from generalized
-                    counterexample *)
-                 let block_clause' = 
-                   C.mk_clause_of_literals
-                     (C.BlockRec block_clause)
-                     (List.map Term.negate cti_gen) 
-                 in
-
-                 SMTSolver.trace_comment solver
-                   (Format.asprintf 
-                      "@[<hv>New clause at depth %d to block #%d:@ #%d @[<hv 1>{%a}@]@]"
-                      (List.length trace)
-                      (C.id_of_clause block_clause)
-                      (C.id_of_clause block_clause')
-                      (pp_print_list Term.pp_print_term ";@ ")
-                      (C.literals_of_clause block_clause'));
+                  SMTSolver.trace_comment solver
+                    (Format.asprintf 
+                       "@[<hv>New clause at depth %d to block #%d:@ #%d @[<hv 1>{%a}@]@]"
+                       (List.length trace)
+                       (C.id_of_clause block_clause)
+                       (C.id_of_clause block_clause')
+                       (pp_print_list Term.pp_print_term ";@ ")
+                       (C.literals_of_clause block_clause'));
 
 
-                 block 
-                   solver
-                   input_sys 
-                   aparam 
-                   trans_sys 
-                   prop_set
-                   term_tbl
-                   predicates
-                   (([block_clause', (block_clause :: block_trace)], 
-                     r_pred_i) :: trace) 
-                   frames_tl
+                  block 
+                    solver
+                    input_sys 
+                    aparam 
+                    trans_sys 
+                    prop_set
+                    term_tbl
+                    predicates
+                    (([block_clause', (block_clause :: block_trace)], 
+                      r_pred_i) :: trace) 
+                    frames_tl
 
         )
 
@@ -3022,11 +2980,8 @@ let main input_sys aparam trans_sys =
           (Flags.Smt.solver ())
       in
 
-
       let bound =
-        match Flags.IC3.abstr () with
-          | `None -> 1
-          | `IA -> 3
+	3
       in
 
       (* Declare uninterpreted function symbols *)
@@ -3115,22 +3070,13 @@ let main input_sys aparam trans_sys =
       let trans_sys_props = 
         TransSys.props_list_of_bound trans_sys Numeral.zero 
       in
+
       let predicates =
-
-        match Flags.IC3.abstr () with
-
-          | `IA ->
-
-            (TransSys.init_of_bound None trans_sys Numeral.zero)
-            ::
-            List.map
-              (fun (s,t) -> t)
-              (TransSys.props_list_of_bound trans_sys Numeral.zero) 
-
-          | `None ->
-
-            []
-
+        (TransSys.init_of_bound None trans_sys Numeral.zero)
+        ::
+          List.map
+          (fun (s,t) -> t)
+          (TransSys.props_list_of_bound trans_sys Numeral.zero) 
       in
 
       SMTSolver.trace_comment solver "bumping predicate states now";
