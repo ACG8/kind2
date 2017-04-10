@@ -882,8 +882,27 @@ let abstr_simulate trace trans_sys raise_cex =
    a list of cubes that are to be shown unreachable in that frame.
 
 *)
-let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates = 
+let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates =
 
+  let gen_cti cti =		  
+    (* Generalize the counterexample to a list of literals
+       
+       R_i-1[x] & C[x] & T[x,x'] & ~C[x'] is sat *)
+    List.map 
+      (fun p ->match  Eval.eval_term
+          (TransSys.uf_defs trans_sys)
+          cti
+          p
+        with
+	  (* Only positive or negative evaluations of predicates *)
+        | Eval.ValBool true -> p
+        | Eval.ValBool false -> Term.negate p
+          | _ -> raise (Invalid_argument "abstract cex evaluation")
+	     
+      )
+      predicates
+  in
+  
   function 
 
     (* Nothing to block in frames above, current frame is R_k *)
@@ -945,35 +964,8 @@ let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates =
               (
                 
                 (* Extrapolate from counterexample to a cube in R_k *)
-                let cti_gen = 
-		  
-                  (* Evaluate all predicates on CTI *)
-                  List.map 
-
-                    (fun p ->
-
-                      match
-
-                            (* Evaluate predicate *)
-                        Eval.eval_term
-                          (TransSys.uf_defs trans_sys)
-                          cti
-                          p
-                          
-                      with
-
-                            (* Predicate evaluates to true, use positively *)
-                      | Eval.ValBool true -> p
-
-                            (* Predicate evaluates to true, use negatively *)
-                      | Eval.ValBool false -> Term.negate p
-
-                            (* Predicate must evaluate to either true or
-                               false, we cannot have a partial model *)
-                      | _ -> assert false)
-                    
-                    predicates
-                    
+                let cti_gen =
+		  gen_cti cti
                 in
 
                 (* Create a clause with activation literals from
@@ -1498,21 +1490,7 @@ let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates =
 
                     R_i-1[x] & C[x] & T[x,x'] & ~C[x'] is sat *)
                   let cti_gen =
-                    List.map 
-                      (fun p ->match  Eval.eval_term
-                          (TransSys.uf_defs trans_sys)
-                          cti
-                          p
-                        with
-
-                        | Eval.ValBool true -> p
-
-                        | Eval.ValBool false -> Term.negate p
-
-                        | _ -> raise (Invalid_argument "abstract cex evaluation")
-
-                      )
-                      predicates
+		    gen_cti cti
                   in
 
                   (* Create a clause with activation literals from generalized
@@ -2234,7 +2212,9 @@ let fwd_propagate solver input_sys aparam trans_sys prop_set frames predicates =
              
 (*
    TODO: After a restart we want to propagate all used blocking
-   clauses into R_1. *)
+  clauses into R_1. *)
+(*let rec ic3ia solver input_sys aparam trans*)
+    
 let rec ic3 solver input_sys aparam trans_sys prop_set frames predicates =
 
   (* Must have checked for 0 and 1 step counterexamples, either by
