@@ -915,7 +915,7 @@ let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates =
 
         (* Head of frames is the last frame *)
         | r_k :: frames_tl as frames -> 
-
+	   
           (* Receive and assert new invariants *)
           handle_events
             solver
@@ -929,7 +929,7 @@ let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates =
             (Format.sprintf 
                "block: Check if all successors of frontier R_%d are safe."
                (List.length frames));
-
+	  
           match
             
             (* Check P[x] & R_k[x] & T[x,x'] |= P[x']
@@ -1527,823 +1527,220 @@ let rec block solver input_sys aparam trans_sys prop_set term_tbl predicates =
 
       )
 
-
 (* ************************************************************************ *)
 (* Forward propagation                                                      *)
 (* ************************************************************************ *)
 
-(* Split list of clauses into those that are inductive and those that
-   are not *)
-let rec partition_inductive
-    solver
-    trans_sys
-    frame
-    not_inductive
-    maybe_inductive = 
+let partition_clauses_to_keep_and_propagate solver trans_sys prop_set frame clauses =
 
-  (* Use activation literals of clauses on lhs *)
-  let actlits_p0 = 
-    List.map (C.actlit_p0_of_clause solver) (frame @ maybe_inductive) 
+    (* define positive activation literals for things that are true in this frame *)
+  let actlits_p0 =
+    List.map (C.actlit_p0_of_clause solver) (frame @ clauses)
   in
 
-  (* Conjunction of clauses *)
-  let clauses = Term.mk_and (List.map C.term_of_clause maybe_inductive) in
+  let rec partition clauses_to_keep propagation_candidates =
 
-  (* Assert p0 => ~(C_1' & ... & C_n') *)
-  let actlit_n1 = 
-    C.create_and_assert_fresh_actlit solver "is_ind" clauses C.Actlit_n1
-  in
+      (* Assert n1 => ~(C_1' & ... & C_n') *)
+    let actlit_n1 =
+      C.create_and_assert_fresh_actlit
+	solver
+	"fwd_prop"
+	(List.map C.term_of_clause propagation_candidates |> Term.mk_and)
+	C.Actlit_n1
+    in
 
-  SMTSolver.trace_comment
-    solver
-    "Checking for inductiveness of clauses";
-  
-  match 
+    let deactivate_n1 =Term.mk_not actlit_n1 |> SMTSolver.assert_term solver in
     
-    (* Are all clauses inductive? 
-       
-       Check R & C_1 & ... & C_n & T |= C_1' & ... & C_n'
-    *)
-    SMTSolver.check_sat_assuming_ab 
+      (*Check P[x] & R[x] & T[x,x'] |= n1*)
+    match SMTSolver.check_sat_assuming_ab
       solver
-
-      (* Get model for failed entailment check *)
       (fun solver ->
-        SMTSolver.get_var_values
-          solver
-          (TransSys.get_state_var_bounds trans_sys)
-          (TransSys.vars_of_bounds trans_sys Numeral.zero Numeral.one))
-      
+	SMTSolver.get_var_values
+	  solver
+	  (TransSys.get_state_var_bounds trans_sys)
+	  (TransSys.vars_of_bounds trans_sys Numeral.zero Numeral.one))
       (fun _ -> ())
+      (C.actlit_p0_of_prop_set solver prop_set :: actlit_n1 :: actlits_p0)
       
-      (actlit_n1 :: actlits_p0)
-      
-  with
+    with
 
-    (* Some candidate clauses are not inductive: filter out the ones
-       that could still be *)
-    | SMTSolver.Sat model -> 
+      (*
+	At least one of the clauses is not propagated. 
+	Note those that are not propagated in this model
+	and try again with the others.
+      *)
+    | SMTSolver.Sat model ->
+       let propagation_candidates , clauses_that_did_not_propagate =
+	 List.partition
+	   (function clause ->
+	     (C.term_of_clause clause
+		 |> Term.bump_state Numeral.one
+		 |> Eval.eval_term [] model
+		 |> Eval.bool_of_value))
+	   propagation_candidates
+       in
+
+       let clauses_to_keep = clauses_to_keep @ clauses_that_did_not_propagate in
+       deactivate_n1;
+
+       if propagation_candidates = []
+       then
+	 (clauses_to_keep, [])
+       else
+	 partition
+	   clauses_to_keep
+	   propagation_candidates
+      (*All clauses are propagated. We are done.*)
+    | SMTSolver.Unsat () ->
+       deactivate_n1;
+      clauses_to_keep, propagation_candidates
+  in
+  
+  partition [] clauses
+     
+    
+let fwd_propagate solver input_sys aparam trans_sys prop_set frames =
+
+  let add_clause_to_frame frame clause =
+    let literals = C.literals_of_clause clause in
+
+    try F.add literals clause frame with Invalid_argument _ ->
       
-      (* Separate not inductive terms from potentially inductive terms 
-         
-         C_1 & ... & C_n & T & ~ (C_1' & ... & C_n') is satisfiable,
-         partition C_1', ..., C_n' by their model value, false terms are
-         certainly not inductive, true terms can be inductive. *)
-      let maybe_inductive', not_inductive_new = 
-        List.partition 
-          (function c -> 
-            C.term_of_clause c
-            |> Term.bump_state Numeral.one
-            |> Eval.eval_term [] model
-            |> Eval.bool_of_value)
-          maybe_inductive
+      (* Is clause subsumed in frame? *)
+      if F.is_subsumed frame literals then
+	(C.deactivate_clause solver clause; frame)
+      else
+	(F.subsume frame literals
+	    |> count_subsumed solver
+	    |> deactivate_subsumed solver
+	    |> snd
+	    |> F.add literals clause)
+  in
+
+  let update = handle_events solver input_sys aparam trans_sys (C.props_of_prop_set prop_set) in
+  
+  let rec fwd_propagate solver input_sys aparam trans_sys propagated_clauses previous_frames =
+    
+    (*input: frames in ascending order*)
+    function
+    (* last frame, return list of frames with new one tacked on the end*)
+    | [] ->
+       update;
+      
+      (List.fold_left
+	 add_clause_to_frame
+	 F.empty
+	 propagated_clauses)
+      :: previous_frames
+
+    | frame :: next_frames ->
+       update;
+
+      (* List of all clauses in frames after this one *)
+      let aggregated_clauses =
+	List.fold_left
+	  (fun acc frame -> (F.values frame) @ acc)
+	  []
+	  next_frames
       in
 
-      (* Clauses found to be not inductive *)
-      let not_inductive' = not_inductive @ not_inductive_new in
-
-      (* Deactivate activation literal *)
-      Term.mk_not actlit_n1 |> SMTSolver.assert_term solver;
-      Stat.incr Stat.ic3_stale_activation_literals;
-
-      (* No clauses are inductive? *)
-      if maybe_inductive = [] then (not_inductive', []) else
-        
-        (* Continue checking if remaining clauses are inductive *)
-        partition_inductive 
-          solver
-          trans_sys 
-          frame
-          not_inductive'
-          maybe_inductive'
-
-    (* All candidate clause are inductive: return clauses show not to be
-       inductive and inductive clauses *)
-    | SMTSolver.Unsat () ->
-      
-    (* Deactivate activation literal *)
-      Term.mk_not actlit_n1 |> SMTSolver.assert_term solver;
-      Stat.incr Stat.ic3_stale_activation_literals;
-
-      not_inductive, maybe_inductive
-
+      (* Add propagated clauses to this frame *)
+      let frame =
+	List.fold_left
+	  add_clause_to_frame
+	  frame
+	  propagated_clauses
+      in
 
       
-(* Split list of clauses into clauses that can be propagated relative
-   to the frame and those that cannot be *)
-let partition_fwd_prop
-    solver
-    trans_sys
-    prop_set
-    frame
-    clauses = 
+      let clauses_to_keep, clauses_to_propagate =
+	partition_clauses_to_keep_and_propagate
+	  solver
+	  trans_sys
+	  prop_set
+	  aggregated_clauses
+	  (F.values frame)
+      in
 
-  (* Use activation literals of clauses on lhs *)
-  let actlits_p0 =
-    List.map (C.actlit_p0_of_clause solver) (frame @ clauses) 
-  in
+      (* If all clauses propagate, then this frame is the same as the next and we are done*)
+      if clauses_to_keep = [] then
 
-  (* Check until we find a set of clauses that can be propagated
-     together *)
-  let rec partition_fwd_prop' keep maybe_prop = 
-
-    SMTSolver.trace_comment
-      solver
-      "partition_fwd_prop: Checking for forward propagation of clause set";
-
-    (* Assert n1 => ~(C_1' & ... & C_n') *)
-    let actlit_n1 = 
-      C.create_and_assert_fresh_actlit 
-        solver
-        "fwd_prop" 
-        (List.map C.term_of_clause maybe_prop |> Term.mk_and) 
-        C.Actlit_n1
-    in
-
-    match
-    
-      (* Can all clauses be propagated? 
-         
-         Check P[x] & R[x] & T[x,x'] |= C_1[x'] & ... & C_n[x']
-      *)
-      SMTSolver.check_sat_assuming_ab 
-        solver
-
-        (* Get model for failed entailment check *)
-        (fun solver ->
-          SMTSolver.get_var_values
-            solver
-            (TransSys.get_state_var_bounds trans_sys)
-            (TransSys.vars_of_bounds trans_sys Numeral.zero Numeral.one))
-
-        (fun _ -> ())
-
-        (C.actlit_p0_of_prop_set solver prop_set :: actlit_n1 :: actlits_p0)
-
-    with
-        
-      (* Some candidate clauses cannot be propagated: filter out the ones
-         that could still be *)
-      | SMTSolver.Sat model -> 
-
-        (* Separate not propagateable terms from potentially propagateable
-           terms
-           
-           C_1 & ... & C_n & T & ~ (C_1' & ... & C_n') is satisfiable,
-           partition C_1', ..., C_n' by their model value, false terms are
-           certainly not propagateable, true terms might be propagated. *)
-        let maybe_prop', keep_new = 
-          List.partition 
-            (function c -> 
-              C.term_of_clause c
-              |> Term.bump_state Numeral.one
-              |> Eval.eval_term [] model
-              |> Eval.bool_of_value)
-            maybe_prop
-        in
-        
-        (* Clauses found not propagateable *)
-        let keep' = keep @ keep_new in
-
-        (* Deactivate activation literal *)
-        Term.mk_not actlit_n1 |> SMTSolver.assert_term solver;
-        Stat.incr Stat.ic3_stale_activation_literals;
-        
-        (* No clauses can be propagated? *)
-        if maybe_prop' = [] then (keep', []) else
-          
-          (* Continue checking if remaining clauses are inductive *)
-          partition_fwd_prop' 
-            keep'
-            maybe_prop'
-            
-      (* All clause can be forward propagated: return clauses to keep and
-         clauses to propagate *)
-      | SMTSolver.Unsat () ->
-
-        (* Deactivate activation literal *)
-        Term.mk_not actlit_n1 |> SMTSolver.assert_term solver;
-        Stat.incr Stat.ic3_stale_activation_literals;
-        
-        keep, maybe_prop
-
-
-            
-            
-  in
-
-            
-  (* Check if all clauses can be propagated *)
-  partition_fwd_prop' [] clauses
-
-    
-(* Forward propagate clauses in all frames *)
-let fwd_propagate solver input_sys aparam trans_sys prop_set frames predicates = 
-
-  let subsume_and_add a c =
-
-    SMTSolver.trace_comment
-      solver
-      (Format.asprintf
-         "@[<v>subsume_and_add: clause %d@]"
-         (C.id_of_clause c));
-
-    (* Forward propagated clause to add to frame *)
-    let c' =
-
-      if 
-
-        (* Inductive generalization after forward propagation? *)
-        Flags.IC3.fwd_prop_ind_gen () ||
-
-        (* Inductively generalize forward propagated clause that was
-           not generalized *)
-        (match C.source_of_clause c with
-          | C.CopyFwdProp _ -> true
-          | _ -> false)
-
-      then
-
-
-        (Stat.time_fun Stat.ic3_ind_gen_time
-           (fun () -> 
-              ind_generalize 
-                solver
-                prop_set
-                (F.values a |> List.map (C.actlit_p0_of_clause solver))
-                c
-                (C.literals_of_clause c)))
+	(* Extract inductive invariant *)
+	let ind_inv =
+	  Term.mk_and
+	    (List.fold_left
+	       (fun acc clause -> List.map C.term_of_clause (F.values clause) @ acc)
+	       (List.map C.term_of_clause clauses_to_propagate)
+	       (next_frames))
+	in
+	
+	raise (Success (List.length frames, ind_inv))
 
       else
 
-        (* Propagate clause as it is *)
-        c
-
-    in
-
-    (* Literals of clause as key for trie *)
-    let l = C.literals_of_clause c' in
-
-    (* Subsumption after forward propagation? *)
-    if Flags.IC3.fwd_prop_subsume () then
-
-      (* Is clause subsumed in frame? *)
-      if F.is_subsumed a l then
-
-        (
-
-          SMTSolver.trace_comment
-            solver
-            (Format.asprintf
-               "@[<v>Clause is subsumed in frame@,%a@]"
-               (pp_print_list Term.pp_print_term "@,")
-               (F.values a |> List.map (C.actlit_p0_of_clause solver)));
-
-          (* Deactivate activation literals of subsumed clause *)
-          C.deactivate_clause solver c';
-
-          (* Increment statistics *)
-          Stat.incr Stat.ic3_fwd_subsumed;
-
-          (* Drop clause from frame *)
-          a)
-
-      else
-
-        (* Subsume in frame with clause *)
-        F.subsume a l
-
-        (* Increment statistics *)
-        |> count_subsumed solver
-
-        (* Deactivate activation literals of subsumed clauses *)
-        |> deactivate_subsumed solver
-
-        (* Continue with frame after subsumption *)
-        |> snd
-
-        (* Add clause to frame  *)
-        |> F.add l c'
-
-    else
-
-      (* Adding a clause may fail if it a prefix of a clause in the
-         trie, or if a clause in the trie is a prefix of this
-         clause *)
-      try F.add l c' a with Invalid_argument _ ->
-
-        SMTSolver.trace_comment
-          solver
-          (Format.asprintf
-             "@[<v>Failed to add clause to trie, checking subsumption@]");
-
-        (* Is clause subsumed in frame? *)
-        if F.is_subsumed a l then
-          (C.deactivate_clause solver c';
-           SMTSolver.trace_comment
-             solver
-             (Format.asprintf
-                "@[<v>Clause is subsumed in frame@,%a@]"
-                (pp_print_list Term.pp_print_term "@,")
-                (F.values a |> List.map (C.actlit_p0_of_clause solver)));
-           Stat.incr Stat.ic3_fwd_subsumed;
-           a)
-        else
-          F.subsume a l
-          |> count_subsumed solver
-          |> deactivate_subsumed solver
-          |> snd
-          |> F.add l c'
-
+	let modified_frame =
+	  List.fold_left
+	    add_clause_to_frame
+	    F.empty
+	    clauses_to_keep
+	in
+	
+	fwd_propagate
+	  solver
+	  input_sys
+	  aparam
+	  trans_sys
+	  clauses_to_propagate
+	  (modified_frame :: previous_frames)
+	  next_frames
+	
   in
 
-  let rec fwd_propagate' solver input_sys aparam trans_sys prop frames =
-
-    function 
-
-      (* After the last frame *)
-      | [] -> 
-
-        (* Receive and assert new invariants *)
-        handle_events 
-          solver
-          input_sys
-          aparam
-          trans_sys
-          (C.props_of_prop_set prop_set);
-
-        (* Check inductiveness of blocking clauses? *)
-        if Flags.IC3.check_inductive () && prop <> [] then 
-
-          (
-
-            SMTSolver.trace_comment
-              solver
-              "fwd_propagate: Checking for inductiveness of clauses \
-               in last frame.";
-
-            (* Split clauses to be propagated into the new frame into
-               inductive and non-inductive clauses *)
-            let non_inductive_clauses, inductive_clauses =
-              partition_inductive
-                solver
-                trans_sys
-                []
-                []
-                prop
-            in
-
-            (* Some clauses found inductive *)
-            if inductive_clauses <> [] then 
-
-              (
-
-                let empty_prop_set = C.prop_set_of_props [] in
-
-                let inductive_clauses_gen = 
-                  List.map
-                    (fun c ->
-                       (Stat.time_fun Stat.ic3_ind_gen_time
-                          (fun () -> 
-                             ind_generalize 
-                               solver
-                               empty_prop_set
-                               []
-                               c
-                               (C.literals_of_clause c))))
-                    inductive_clauses
-                in
-
-                (* Convert clauses to terms *)
-                let inductive_terms =
-                  List.map C.term_of_clause inductive_clauses_gen 
-                in
-
-                (* Broadcast inductive clauses as invariants *)
-                List.iter (
-                  fun i ->
-                    (* Certificate 1 inductive *)
-                    let cert = (1, i) in
-                    Event.invariant
-                      (TransSys.scope_of_trans_sys trans_sys) i cert false
-                ) inductive_terms ;
-
-                (* Increment statistics *)
-                Stat.incr 
-                  ~by:(List.length inductive_clauses) 
-                  Stat.ic3_inductive_blocking_clauses;
-
-                (* Add inductive blocking clauses as invariants *)
-                List.iter (
-                  fun i ->
-                    (* Certificate 1 inductive *)
-                    let cert = (1, i) in
-                    TransSys.add_invariant trans_sys i cert |> ignore
-                ) inductive_terms ;
-
-                SMTSolver.trace_comment
-                  solver
-                  "fwd_propagate: Asserting new invariants.";
-
-                (* Add invariants to solver instance *)
-                List.iter 
-                  (function t -> 
-                    SMTSolver.assert_term solver t;
-                    Term.bump_state Numeral.one t |> SMTSolver.assert_term solver) 
-                  inductive_terms
-
-              );
-
-            (* Add a new frame with the non-inductive clauses *)
-            let frames' =
-              (List.fold_left
-                 subsume_and_add
-                 F.empty
-                 non_inductive_clauses)
-              :: frames
-            in
-
-            (* DEBUG *)
-            if debug_assert then
-              assert (check_frames solver prop_set [] frames');
-
-            frames'
-
-          )
-
-        else
-
-          (
-
-            (* Add a new frame with clauses to propagate *)
-            let frames' =
-              (List.fold_left
-                 subsume_and_add
-                 F.empty
-                 prop)
-              :: frames
-            in
-            
-            (* DEBUG *)
-            if debug_assert then
-              assert (check_frames solver prop_set [] frames');
-            
-            frames')
-
-      (* Frames in ascending order *)
-      | frame :: frames_tl -> 
-
-        (* Receive and assert new invariants *)
-        handle_events 
-          solver
-          input_sys
-          aparam
-          trans_sys
-          (C.props_of_prop_set prop_set);
-
-        SMTSolver.trace_comment
-          solver
-          (Format.sprintf 
-             "fwd_propagate: Checking forward propagation of clauses \
-              in frame %d."
-             (succ (List.length frames)));
-
-        (* Clauses from frames up to R_k are contained in this and all
-           preceding frames up to R_1 *)
-        let frames_tl_full = 
-          List.fold_left (fun a f -> ((F.values f) @ a)) [] frames_tl
-        in
-
-        (* Add propagated clauses to frame with subsumption *)
-        let frame' =
-          List.fold_left subsume_and_add frame prop
-        in
-        
-        (* DEBUG *)
-        if debug_assert then
-          assert
-            (check_frames'
-               solver
-               prop_set
-               frames_tl_full
-               (frame' :: frames));
-        
-        (* Separate clauses that propagate from clauses to keep in
-           this frame *)
-        let keep, fwd = 
-          partition_fwd_prop
-            solver
-            trans_sys
-            prop_set
-            frames_tl_full
-            (F.values frame')
-        in
-
-        (* Update statistics *)
-        Stat.incr 
-          ~by:(List.length fwd) 
-          Stat.ic3_fwd_propagated;
-
-        (* DEBUG *)
-        if debug_assert then
-          assert
-            (check_frames'
-               solver
-               prop_set
-               (frames_tl_full @ fwd)
-               ((List.fold_left
-                   (fun a c -> 
-                     F.add (C.literals_of_clause c) c a) frame' keep) :: frames));
-
-        (* All clauses propagate? *)
-        if keep = [] then 
-
-          (
-
-            Stat.set (List.length frames |> succ) Stat.ic3_fwd_fixpoint;
-            
-            (* Extract inductive invariant *)
-            let ind_inv = 
-              (List.fold_left 
-                 (fun a c -> List.map C.term_of_clause (F.values c) @ a) 
-                 (List.map C.term_of_clause fwd)
-                 (frames_tl))
-              |> Term.mk_and
-            in
-
-            (* Activation literals for inductive invariant *)
-            let ind_inv_p0, ind_inv_n0, ind_inv_n1 = 
-
-              let mk = 
-                C.create_and_assert_fresh_actlit
-                  solver
-                  "ind_inv"
-                  ind_inv
-              in
-
-              mk C.Actlit_p0, mk C.Actlit_n0, mk C.Actlit_n1
-
-            in
-
-            (* DEBUG
-
-               Check if inductive invariant is initial *)
-            if debug_assert then
-              assert
-                (not
-                   (SMTSolver.check_sat_assuming_tf
-                      solver
-                      [C.actlit_of_frame 0; ind_inv_n0]));
-
-            (* DEBUG
-
-               Check if inductive invariant is inductive *)
-            if debug_assert then
-              assert
-                (not
-                   (SMTSolver.check_sat_assuming_tf
-                      solver
-                      [C.actlit_p0_of_prop_set solver prop_set;
-                       ind_inv_p0;
-                       ind_inv_n1])); 
-
-            (* Fixpoint found, this frame is equal to the next *)
-            raise (Success (List.length frames, ind_inv))
-
-          )
-
-        else
-
-          (
-
-            let fwd' = 
-
-              (* Try propagating clauses before generalization? *)
-              if Flags.IC3.fwd_prop_non_gen () then
-
-                (
-                  
-                  SMTSolver.trace_comment
-                    solver
-                    (Format.sprintf 
-                       "fwd_propagate: Checking forward propagation of clauses \
-                      before generalization in frame %d."
-                       (succ (List.length frames)));
-
-                  let keep_before_gen =
-                    List.fold_left
-                      (fun a c ->
-                        match C.undo_ind_gen c with
-                          | None -> a
-                          | Some p ->
-
-                            let p' = C.copy_clause_fwd_prop p in
-
-                            SMTSolver.trace_comment solver
-                              (Format.asprintf 
-                                 "@[<hv>Copied clause #%d in forward propagation:@ \
-                                        #%d @[<hv 1>{%a}@]@]"
-                                 (C.id_of_clause p)
-                                 (C.id_of_clause p')
-                                 (pp_print_list Term.pp_print_term ";@ ")
-                                 (C.literals_of_clause p'));
-                            
-                            p' :: a)
-                      []
-                      keep
-                  in
-                  
-                  (* Take parent clauses of not propagating clauses and
-                     try to propagate *)
-                  let keep', fwd' = 
-                    partition_fwd_prop
-                      solver
-                      trans_sys
-                      prop_set
-                      (frames_tl_full @ keep @ fwd)
-                      keep_before_gen
-                  in
-
-                  (* Deactivate activation literals of not propagating
-                     clauses *)
-                  List.iter (C.deactivate_clause solver) keep';
-                  
-                  (* Update statistics *)
-                  Stat.incr ~by:(List.length fwd') Stat.ic3_fwd_gen_propagated;
-
-                  (* Keep clauses as before, in addition propagate
-                     non-generalized clauses *)
-                  (fwd @ fwd')
-
-                )
-                  
-              else
-                
-                (* Propagate clauses as before *)
-                fwd 
-                  
-            in
-
-            (* Propagate clauses in next frame *)
-            fwd_propagate' 
-              solver
-              input_sys 
-              aparam 
-              trans_sys
-              fwd'
-              ((List.fold_left subsume_and_add F.empty keep)
-               :: frames)
-              frames_tl
-
-          )
-
-  in
-
-  (* Forward propagate all clauses and add a new frame *)
-  fwd_propagate'
+  fwd_propagate
     solver
-    input_sys 
+    input_sys
     aparam
     trans_sys
     []
     []
     (List.rev frames)
-
-             
-(*
-   TODO: After a restart we want to propagate all used blocking
-  clauses into R_1. *)
-(*let rec ic3ia solver input_sys aparam trans*)
-    
+      
 let rec ic3 solver input_sys aparam trans_sys prop_set frames predicates =
 
-  (* Must have checked for 0 and 1 step counterexamples, either by
-     delegating to BMC or before this point *)
-  let bmc_checks_passed prop_set =
-
-    (* Every property is either invariant or at least 1-true *)
-    List.for_all 
-      (fun (p, _) -> match TransSys.get_prop_status trans_sys p with
-         | Property.PropInvariant _ -> true
-         | Property.PropKTrue k when k >= 1 -> true
-         | _ -> false)
-      (C.props_of_prop_set prop_set)
-
-  in
-
-  (* Current k is length of trace *)
-  let ic3_k = succ (List.length frames) in
-
-  Event.log L_info "IC3 main loop at k=%d" ic3_k;
-
-  Event.progress ic3_k;
-
-  Stat.set ic3_k Stat.ic3_k;
-
-  Stat.start_timer Stat.ic3_fwd_prop_time;
-
-  let frames' =
-
-    try 
-
-      (* Forward propagate clauses in all frames *)
+  let frames =
+    
       fwd_propagate
-        solver
-        input_sys
-        aparam 
-        trans_sys
-        prop_set
-        frames
-        predicates
-
-    (* Fixed point reached *)
-    with Success (ic3_k, ind_inv) -> 
-
-      if 
-
-        (* No 0- or 1-step countexample? *)
-        bmc_checks_passed prop_set 
-
-      then
-
-        (* Property is proved *)
-        raise (Success (ic3_k, ind_inv)) 
-
-      else
-
-        (* Wait until BMC process has passed k=1 *)
-        let rec wait_for_bmc () = 
-
-          Event.log L_info "Waiting for BMC to pass k=1";
-
-          (* Receive messages and update transition system *)
-          handle_events 
-            solver
-            input_sys
-            aparam 
-            trans_sys
-            (C.props_of_prop_set prop_set);
-
-          (* No 0- or 1-step countexample? *)
-          if bmc_checks_passed prop_set then
-
-            (* Raise exception again *)
-            raise (Success (ic3_k, ind_inv))
-
-          else
-
-            (
-
-              (* Delay *)
-              minisleep 0.1;
-
-              (* Wait *)
-              wait_for_bmc ()
-
-            )
-
-        in
-
-        (* Wait until BMC has passed k=1 *)
-        wait_for_bmc ()
+	solver
+	input_sys
+	aparam
+	trans_sys
+	prop_set
+	frames
 
   in
-
-  Stat.record_time Stat.ic3_fwd_prop_time;
-
-  Stat.set_int_list (frame_sizes frames') Stat.ic3_frame_sizes;
-
-  Stat.start_timer Stat.ic3_strengthen_time;
-
-  (* Recursively block counterexamples in frontier frame *)
-  let frames'' , predicates = 
+  
+  let frames , predicates =
     block
-      solver
+      solver		(*solver*)
       input_sys
-      aparam 
-      trans_sys
-      prop_set
-      ()
-      predicates 
-      []
-      frames' 
+      aparam
+      trans_sys		(*transition system*)
+      prop_set		
+      ()		(*term_tbl, which appears to be defunct*)
+      predicates	(*predicates*)
+      []		(*trace: list of (cube to block, frame)s above current frame in ascending order*)
+      frames		(*frames: list of frames below current frame in descending order*)
   in
 
-  Stat.record_time Stat.ic3_strengthen_time;
-
-  Stat.set_int_list (frame_sizes frames'') Stat.ic3_frame_sizes;
-
-  Stat.update_time Stat.ic3_total_time; 
-
-  (* Output statistics *)
-  if output_on_level L_debug then print_stats ();
-
-  (* No reachable state violates the property, continue with next k *)
-  ic3 solver input_sys aparam trans_sys prop_set frames'' predicates
-
-(* Get a values for the state variables at offset [i], add values to
-   path, and return an equational constraint at offset zero for values
-   from the model *)
+  ic3
+    solver
+    input_sys
+    aparam
+    trans_sys
+    prop_set
+    frames
+    predicates
+  
 let add_to_path model path state_vars i = 
 
   (* Turn variable instances to state variables and sort list *)
@@ -2545,8 +1942,7 @@ let extract_cex_path solver trans_sys trace =
    contains the blocking clauses before a restart. Therefore we know
    that I |= R. *)
 let add_to_r1 clauses = []
-
-
+  
 (* Helper function for restarts *)
 let rec restart_loop solver input_sys aparam trans_sys props predicates = 
 
